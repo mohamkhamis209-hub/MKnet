@@ -1,0 +1,9 @@
+#!/bin/bash
+# Quota Manager postinst - runs as root after the .deb payload lands in
+# /opt/quota-manager. All the real work (venv, WAN-preserve, setup script,
+# enable + start) lives in the shared scripts/post_install.sh so the .deb, .rpm,
+# Arch package and generic tarball all behave identically.
+set -euo pipefail
+
+exec bash /opt/quota-manager/scripts/post_install.sh deb
+exit 0

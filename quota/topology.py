@@ -1,0 +1,176 @@
+"""WAN-topology detection for the dashboard WAN tab.
+
+In default (LAN) mode the box sits behind the router and the client subnet is
+the only thing it owns. In strong (WAN) mode the box dials the PPPoE line
+itself and ``ppp0`` carries the public IP — a static-IP device then has no
+second router to bypass through. This module only *detects* whether a PPP
+interface is up; the actual bring-up is done by the setup script
+(``QUOTA_TOPOLOGY=wan``) and the dashboard toggle only persists the preference.
+
+Everything here is best-effort and never raises: no root, no ``ip``, or no
+``/sys`` (Windows dev box, tests) degrades to a safe ``"unknown"`` so the rest
+of the app keeps working (mirrors the engine's graceful degradation).
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import socket
+import subprocess
+from pathlib import Path
+from typing import Callable
+
+log = logging.getLogger("quota.topology")
+
+RunCommand = Callable[[list[str]], tuple[int, str]]
+
+
+def _default_run_command(argv: list[str]) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        return 127, "command not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    return proc.returncode, (proc.stdout or proc.stderr or "")
+
+
+def detect_ppp(interface: str = "ppp0",
+               run_command: RunCommand | None = None,
+               sysfs_root: str = "/sys/class/net") -> dict[str, str]:
+    """Report whether ``interface`` (a PPP link, default ``ppp0``) is up.
+
+    Returns ``{"state": ..., "local": ..., "peer": ...}`` where ``state`` is
+    ``"up"``, ``"down"``, or ``"unknown"`` (ip/sysfs unreadable — no root, no
+    ``ip`` binary, or Windows). ``local``/``peer`` are the PPP address pair from
+    ``ip -o -4 addr show dev <iface>`` (empty when not readable). The
+    ``run_command``/``sysfs_root`` injections keep the test deterministic.
+
+    NOTE: a PPP link is judged by its negotiated point-to-point IPv4 address,
+    NOT by ``operstate``. PPP interfaces are carrier-less — the kernel reports
+    ``/sys/class/net/ppp0/operstate`` as ``unknown`` (or ``down``) even while
+    pppd is connected with a live IP, so a fast path that trusted operstate
+    read a dialed-up line as down (the v19.8 box report: pppd "local IP
+    197.121.113.253" while the WAN tab read "ppp0 down / Public IP —").
+    """
+    run = run_command or _default_run_command
+    # Only the interface's existence is reliable from sysfs for ppp; its carrier
+    # state is not.
+    exists = (Path(sysfs_root) / interface).is_dir()
+
+    code, out = run(["ip", "-o", "-4", "addr", "show", interface])
+    if code == 0:
+        # 7: ppp0    inet 100.64.0.2 peer 100.64.0.1/32 scope global ppp0
+        m = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)(?: peer (\d+\.\d+\.\d+\.\d+))?",
+                      out)
+        if m:
+            return {"state": "up", "local": m.group(1), "peer": m.group(2) or ""}
+        # Interface present but carries no IPv4 yet — discovery/LCP in progress.
+        return {"state": "down", "local": "", "peer": ""}
+    if exists:
+        # sysfs still lists the interface but `ip` cannot show an address.
+        return {"state": "down", "local": "", "peer": ""}
+    return {"state": "unknown", "local": "", "peer": ""}
+
+
+def check_internet(hosts: tuple[str, ...] = ("1.1.1.1", "8.8.8.8"),
+                   port: int = 443,
+                   timeout: float = 2.0,
+                   connect: Callable | None = None) -> bool:
+    """Prove the gateway can reach the public internet (the WAN-tab green dot).
+
+    Raw-IP TCP connect — deliberately NOT ICMP (needs root/setuid) and NOT DNS
+    (a resolver failure must not false-negative when routing is fine). Returns
+    True when ANY host accepts a connection; a closed/filtered port, no route,
+    or a timeout all mean "not reachable now". ``connect`` is injectable for
+    tests (default :func:`socket.create_connection`), so a run-wiring test can
+    fake the network instead of dialing out.
+    """
+    connect = connect or socket.create_connection
+    for host in hosts:
+        try:
+            with connect((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _dns_query(server: str, timeout: float) -> bool:
+    """One raw UDP DNS A-query to ``server``; True when a reply arrives.
+
+    A direct query — NOT through dnsmasq — so its cache can't fake an answer.
+    UDP port 53 is exempted from the gateway block (``udp dport 53 accept``), so
+    this reaches the public resolver even while the box's own browsing is cut.
+    """
+    import struct
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        header = struct.pack(">HHHHHH", 0x7B1C, 0x0100, 1, 0, 0, 0)  # id, RD
+        question = b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)  # A IN
+        sock.sendto(header + question, (server, 53))
+        sock.recvfrom(512)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def check_internet_dns(servers: tuple[str, ...] = ("8.8.8.8", "1.1.1.1"),
+                       timeout: float = 2.0,
+                       query: Callable[[str, float], bool] | None = None) -> bool:
+    """Prove the line delivers internet via DNS — works while the box is cut.
+
+    The gateway block drops the box's own TCP egress (``0.0.0.0/0`` in the
+    ``gw_blocked`` set), so the TCP probe reads "down" even though the PPPoE
+    line and every client are fine. DNS is deliberately exempted (that is how
+    clients keep resolving), so a raw UDP query that gets a real answer proves
+    the line carries internet. Returns True when ANY server answers; a timeout,
+    no route, or an unreachable resolver all mean "not reachable now". ``query``
+    is injectable for tests (default :func:`_dns_query`).
+    """
+    query = query or _dns_query
+    for server in servers:
+        try:
+            if query(server, timeout):
+                return True
+        except Exception:  # noqa: BLE001 — a resolver failure must not crash a tick
+            continue
+    return False
+
+
+def restart_pppoe(interface: str = "ppp0",
+                  run_command: RunCommand | None = None) -> dict[str, object]:
+    """Restart the PPPoE dial to renew the public IP (the WAN-tab Restart).
+
+    In WAN mode the box dials the line itself through the ``quota-wan-ppp``
+    systemd unit (pppd in the foreground with ``persist`` — see
+    ``scripts/topology.sh``). Restarting that unit tears the session down and
+    re-dials; on metered Egyptian lines the ISP hands out a fresh public IP on
+    the new session — the same effect as restarting the router. The dial is
+    interrupted for a few seconds while ppp0 comes back up.
+
+    Returns ``{"restarted": bool, "state": "active"|"inactive"|"unknown",
+    "detail": str}`` — ``state`` is ``systemctl is-active``'s answer right
+    after the restart. Never raises: a missing ``systemctl``, no root, or a
+    failed restart degrades to ``restarted=False`` with an honest ``detail``
+    (mirrors :func:`detect_ppp`'s best-effort contract). ``run_command`` is
+    injectable for tests (default: a subprocess).
+    """
+    run = run_command or _default_run_command
+    rc, out = run(["systemctl", "restart", "quota-wan-ppp"])
+    if rc != 0:
+        return {"restarted": False, "state": "unknown",
+                "detail": out.strip() or
+                f"systemctl restart quota-wan-ppp exited {rc}"}
+    code, out2 = run(["systemctl", "is-active", "quota-wan-ppp"])
+    text = (out2 or "").strip().lower()
+    state = text if text in ("active", "inactive") else "unknown"
+    return {"restarted": True, "state": state,
+            "detail": f"quota-wan-ppp restarted — the PPPoE session re-dialed "
+                      f"on {interface} (a fresh public IP if the ISP rotates "
+                      f"it per session)"}
