@@ -1,0 +1,13 @@
+# Gateway deps. Install from THIS file on Kali/Debian:
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-linux.txt
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+aiosqlite==0.22.1
+PyYAML==6.0.3
+pytest==9.1.1           # dev/tests only
+httpx==0.28.1           # fastapi TestClient
+pyflakes>=3.2,<4       # lint (README Tests section)
+aiohttp>=3.9.0         # optional / compatibility

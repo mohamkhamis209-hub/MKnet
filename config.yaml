@@ -1,0 +1,372 @@
+# Quota Manager — gateway configuration (Debian/Kali laptop).
+# The kernel owns the network path: dnsmasq (DHCP+DNS) + nftables NAT/accounting.
+# Clients live on a SEPARATE subnet (192.168.2.0/24, gateway = this laptop) so
+# every byte deterministically crosses the box — no proxy_arp.
+# Values match the defaults baked into scripts/setup_gateway_kali.sh.
+#
+#   python3 run.py --config config.yaml
+# Path overridable at runtime via:  python run.py --config path/to/config.yaml
+#                                   (or the QUOTA_CONFIG env var).
+
+bundle:
+  total_gb: 200.0        # <- change to your monthly bundle
+  reset_day: 0           # day of month the ISP resets; 0 = never auto-reset
+  # 'renew_day' = reset on reset_day above (the ISP's expected renew day,
+  #   0 = never auto-reset);
+  # 'end_of_month' = the ISP's month-end bill — reset_day drives it too
+  #   (many ISPs close the month on the 25th/28th); 0 = calendar end (the 1st).
+  period_type: renew_day
+
+db_path: /var/lib/quota-gateway/quota.db
+log_file: /var/log/quota-gateway/quota.log
+log_level: INFO
+timezone: ""             # IANA name (e.g. Africa/Cairo); empty = system local time
+
+dhcp:
+  enable: true
+  interface: ""          # auto-detected by dnsmasq via the setup script
+  # Clients' gateway = this laptop. It must be the CLIENT-SUBNET address
+  # (192.168.2.1), not the uplink IP: dnsmasq hands it out as option 3
+  # (default gateway) + option 6 (DNS).
+  gateway_ip: 192.168.2.1
+  router_ip: 192.168.1.1      # upstream ISP router (empty "" in WAN mode — the box dials PPPoE)
+  dns_servers: [192.168.1.1, 8.8.8.8]
+  dns_forward: true
+  subnet: 255.255.255.0
+  pool_start: 192.168.2.100   # first address handed to devices
+  pool_end: 192.168.2.200     # last address handed to devices
+  lease_hours: 24
+  # --- IPv6 dual-stack (SLAAC + DHCPv6 on a private ULA /64, NAT66 out) ------
+  # Must match ULA_NET in scripts/setup_gateway_kali.sh (default below). Until
+  # the ISP really delivers IPv6 the box answers client IPv6 with ICMPv6
+  # "no route" so apps fall back to IPv4 instantly; the probe re-checks every
+  # ipv6_probe_interval_s and opens the path by itself when IPv6 appears.
+  ipv6_enable: true
+  ipv6_prefix: "fd00:da7a:2::/64"
+  ipv6_gateway: "fd00:da7a:2::1"
+  ipv6_probe_interval_s: 600
+  lease_file: /var/lib/misc/dnsmasq.leases
+  # App-owned dnsmasq fragment refusing DHCP to "STOP NEW CONNECTIONS" MACs
+  # (one `dhcp-host=<mac>,ignore` line each). Written by run.py, emptied when
+  # the gate is turned off; the setup script never touches it.
+  ignore_file: /etc/dnsmasq.d/quota-ignore.conf
+  # True restarts dnsmasq whenever the fragment changes; False writes the
+  # file but skips the reload (batch several edits first).
+  reload_dnsmasq: true
+  # --- LAN-reality snapshot (kept in BOTH topologies so the dashboard WAN-tab
+  # "Revert to LAN" restores exactly what was there, instead of guessing).
+  # WAN mode erases router_ip / dns_servers from the ACTIVE keys above; these
+  # keep the LAN values. Written by the setup script and the panel apply.
+  # uplink_ip + lan_cidr ALSO drive the WAN-mode router-admin alias: the box
+  # re-adds this address so clients can still reach the router admin page.
+  lan_router_ip: 192.168.1.1
+  lan_dns_servers: [192.168.1.1, 8.8.8.8]
+  uplink_ip: 192.168.1.110    # this box's static uplink IP + prefix (lan_cidr)
+  lan_cidr: 24
+
+engine:
+  enabled: true
+  backend: nftables
+  count_direction: inbound
+  table: quota_gateway
+  # LOCAL (LAN) traffic never consumes the metered bundle: traffic between
+  # clients, and client <-> the uplink LAN (router admin UI, NAS, the router
+  # as DNS), is excluded from the accounting rules (and from the block drops,
+  # so a quota-blocked device keeps LAN access). Empty => derive: client from
+  # dhcp.gateway_ip + dhcp.subnet, uplink from dhcp.router_ip + dhcp.subnet.
+  # The setup script writes both explicitly (accurate, from the real LAN CIDR).
+  # In WAN mode the box keeps the uplink IP as a router-admin alias (so clients
+  # can still reach the router admin page through it), so the uplink subnet IS
+  # local there too: empty => derived from the LAN snapshot (dhcp.uplink_ip +
+  # dhcp.lan_cidr), else dhcp.router_ip + dhcp.subnet.
+  client_subnet: ""
+  uplink_subnet: ""
+  # ARP gateway-lock (default OFF here; the setup script enables it): actively
+  # deny internet to any device that bypasses the box by using the ROUTER as its
+  # gateway (static-IP cheat). The box captures the router's IP on the client
+  # subnet (ARP responder + nftables arp-filter) and drops the bypasser's
+  # frames. Needs root + the LAN interface; leave OFF unless you run the setup
+  # gateway topology (clients on their own subnet with the box as gateway).
+  gateway_arp_lock: false
+  # Deployment topology: "lan" (default) = the box sits behind the router —
+  # clients on their own subnet, the router keeps WiFi + NAT, and the box counts
+  # / blocks what the kernel forwards. "wan" (optional strong mode) = the box
+  # terminates the WAN itself (dials PPPoE, public IP on ppp0) and the router is
+  # a pure bridge/AP, so a static-IP device has NO second router to bypass to.
+  # In "wan" mode the box keeps the uplink IP as a router-admin alias (clients
+  # still reach the router admin page through it — no extra commands on any
+  # device) and the ARP gateway-lock is forced off. The dashboard WAN tab
+  # switches this LIVE ("Apply now" / "Revert to LAN" — the gateway rewires
+  # itself and restarts; no setup script), writing topology_source/topology into
+  # the DB and this file together so they can never disagree. The setup script
+  # also writes it for QUOTA_TOPOLOGY (first install / fresh box).
+  topology: lan
+  # The ARP gateway-lock value to restore when the WAN tab reverts to LAN (the
+  # setup script enables it in LAN mode). The ACTIVE gateway_arp_lock above
+  # flips to false in WAN mode; this keeps the LAN reality for the revert.
+  lan_gateway_arp_lock: true
+  # Count the gateway box's OWN internet consumption (its input/output traffic,
+  # not the clients it forwards) and charge it to the protected "Gateway" user
+  # that the dashboard seeds on first run — so the machine's bundle use sits
+  # INSIDE the quota math instead of being invisible. Off = the box's traffic is
+  # uncounted (its quota block, if the admin sets one, still applies via the
+  # gateway chains).
+  count_gateway: true
+  # Manual override for the "VPN share" gateway whitelist: VPN-server IPs/CIDRs
+  # that must stay reachable when the box's OWN internet is cut (Gateway OFF in
+  # the dashboard) while "VPN share" relays the household through the box's
+  # tunnel. Normally these endpoints are AUTO-learned every ~15 s from the VPN
+  # client's established connections (v2ray/sing-box/xray/tun2socks) — set this
+  # only for a VPN client the auto-learn step can't identify, or a fixed server
+  # you always want allowed. Empty (default) = auto-learned only.
+  gateway_allow_ips: []
+
+# Speed shaping (tc/HTB + fq_codel): per-device and per-user internet speed caps
+# + low-latency (bufferbloat-free) queues. The runtime totals / per-device /
+# per-user limits are edited in the dashboard's Network tab (stored in the DB);
+# this block only sets the defaults and which NIC to shape on.
+#   enabled: true         # master switch (also toggleable in the dashboard)
+#   interface: ""         # empty = auto-detect (the NIC holding gateway_ip)
+#   client_subnet: ""     # empty = derive from gateway_ip + dhcp.subnet
+#   ifb: ifb0
+#   lan_rate_mbps: 1000   # LAN link rate — LAN (client<->uplink-subnet) traffic
+#                         # rides a pass-through class at this full rate instead
+#                         # of the WAN cap (uplink subnet resolved like the
+#                         # nftables engine: engine.uplink_subnet wins)
+shaping:
+  enabled: true
+  interface: ""
+  client_subnet: ""
+  ifb: ifb0
+  lan_rate_mbps: 1000
+  # VPN-share queue control (inert while the tunnel is not active). The box
+  # keeps the bottleneck queue inside its own AQM instead of the ISP buffer:
+  # every WAN rate is programmed at line_margin_pct (x vpn_margin_pct unless
+  # measured), the box's encrypted egress is capped at the UPLOAD total, and
+  # the outer download is policed on ifb1 (cake ingress).
+  line_margin_pct: 93
+  vpn_margin_pct: 85
+  # Run a speed test THROUGH the VPN and put the real numbers here (Mbps).
+  # Both > 0 => they replace the Network-tab totals while the VPN is on.
+  vpn_down_mbps: 12
+  vpn_up_mbps: 1.0
+
+# "VPN share" — route the whole client subnet through the box's VPN. The box
+# runs a VPN client in TUN mode (sing-box/xray `tun`, WireGuard, or tun2socks
+# bridging any v2rayN-style SOCKS/HTTP proxy); with the Network-tab switch ON,
+# every device's internet exits at the VPN provider's IP (policy routing into
+# the tunnel). Kernel quota counting, per-device blocks, and speed shaping keep
+# working (forward chain). DNS queries keep using dnsmasq's normal upstream.
+#   enabled: true          # lets the manager exist; the dashboard switch (DB)
+#                          # is the real master, same as shaping
+#   interface: ""          # tunnel pin (e.g. utun4/wg0); empty = auto-detect
+#                          # (first ARPHRD_NONE tun/utun/wg, stored in the DB)
+#   route_table: 200       # route table used by the client-subnet policy rule
+#   rule_pref: 1000        # rule priority (must beat the main table, 32766)
+#   tun2socks: true        # auto-install + run tun2socks ONLY when VPN share
+#                          # is on but no kernel TUN exists (userspace clients
+#                          # like v2rayN never create one). A real kernel
+#                          # tunnel (xray/sing-box/WireGuard) is always
+#                          # preferred and needs no config edits — the bridge
+#                          # is only the fallback. Downloads the pinned,
+#                          # sha256-verified binary on first use (one-time).
+#   socks_proxy: "127.0.0.1:10808"  # fallback SOCKS; auto-detect prefers the
+#                          # VPN client's actual listener (ss -tlnp)
+#   tun_interface: tun0    # device tun2socks creates (+ tun_ip/tun_gw addrs)
+#   tun_ip: 10.0.0.1
+#   tun_gw: 10.0.0.2
+#   binary: /usr/local/bin/tun2socks
+#   download_url: ""       # empty = auto-built from the pinned release+arch
+#   download_sha256: ""    # empty = built-in per-arch pin; a binary without
+#                          # a pinned checksum is never installed
+vpn_share:
+  enabled: true
+  interface: ""
+  route_table: 200
+  rule_pref: 1000
+  tun2socks: true
+  socks_proxy: "127.0.0.1:10808"
+  tun_interface: tun0
+  tun_ip: 10.0.0.1
+  tun_gw: 10.0.0.2
+  binary: /usr/local/bin/tun2socks
+  download_url: ""
+  download_sha256: ""
+
+web:
+  host: 0.0.0.0
+  port: 8080
+  # Mark session cookies Secure (HTTPS only). Forced on automatically when
+  # tls_certfile/tls_keyfile are set. Keep False on a plain-HTTP LAN box.
+  secure_cookies: false
+  # Optional HTTPS: uvicorn terminates TLS with these (self-signed is fine —
+  # one-time trust step in the browser). Both empty = plain HTTP.
+  tls_certfile: ""
+  tls_keyfile: ""
+  # Serve the FastAPI auto-generated docs (/api/docs + /api/openapi.json)?
+  # The schema is a structured endpoint map — keep False except on a trusted
+  # dev box. The dashboard itself is the admin surface.
+  docs_enabled: false
+
+# Request-level WAF embedded in the web app (api/waf.py): inspects actual HTTP
+# request content the kernel firewall can't see (size/header caps, method
+# allowlist, SQLi/XSS/command-injection/path-traversal signatures, scanner
+# User-Agents, per-endpoint rate limits). mode "auto" = strict (blocking) on
+# WAN, log-only on LAN; fail_mode "closed" = if the layer errors the dashboard
+# becomes unreachable on WAN rather than silently unprotected.
+waf:
+  enabled: true
+  mode: auto
+  max_body_bytes: 1048576
+  max_headers: 40
+  max_header_bytes: 8192
+  fail_mode: closed
+  auto_ban_after: 8
+  ban_seconds: 1800
+  ban_window_seconds: 300
+  endpoint_limits:
+    "/api/login": [20, 60]
+    "/api/report": [60, 60]
+    "/api/dashboard": [120, 60]
+  exceptions: []
+
+# On-demand internal reporting dashboard (/report + /api/report). A read-only
+# consumption view (exact bytes/quota per user and device, events, log tail)
+# that does NOT need the admin session — access is gated by the client's source
+# IP. Passive: nothing auto-opens it; it is a URL you visit on demand.
+#   enabled: true              # false => /report + /api/report always 403
+#   allow_client_subnet: true  # admit any managed client (the DHCP pool)
+#   allowed_ips: []            # extra CIDRs/IPs, e.g. ["192.168.1.0/24"]
+report:
+  enabled: true
+  allow_client_subnet: true
+  allowed_ips: []
+
+# Per-device DNS browsing history (dashboard History tab). The setup script
+# writes an app-owned dnsmasq fragment (log-queries=extra + log-facility) so
+# every query carries its requestor IP; the app tails that log, buckets
+# queries per device/minute/domain, and prunes rows older than the retention.
+#   enabled: true            # false = stop recording (nothing attributed)
+#   dnsmasq_log_file: /var/log/quota-dnsmasq.log
+#   retention_days: 7        # global default; per-user "history_days" overrides
+history:
+  enabled: true
+  dnsmasq_log_file: /var/log/quota-dnsmasq.log
+  retention_days: 7
+
+# Domain-level DNS filtering: per-user/per-device blacklists, allow-list
+# exceptions, custom host redirects, curated blocklist presets (ads/tracking,
+# social media, streaming, gambling), and per-user/per-device upstream
+# DNS-server overrides. Implemented as GENERATED dnsmasq config — no new
+# service is started, and this box already owns DHCP+DNS (see the dhcp:
+# block above). Rules/presets/DNS-server overrides themselves are edited in
+# the dashboard (stored in the DB, api/app.py's /api/dns/* routes); this
+# block only sets where the generated files live and whether to auto-reload.
+#   enabled: true              # master switch
+#   conf_dir: /etc/dnsmasq.d   # dnsmasq's conf-dir (Debian/Kali default)
+#   tags_file: quota-tags.conf     # per-device DHCP tag bindings
+#   rules_file: quota-domains.conf # domain rules + DNS-server overrides
+#   reload_dnsmasq: true       # restart dnsmasq when the generated files
+#                              # change (new address=/server= lines are only
+#                              # picked up on a restart, not a SIGHUP — costs
+#                              # clients a ~1s DNS blip per rule change)
+#   preset_cache_dir: data/dns_presets
+dns_filter:
+  enabled: true
+  conf_dir: /etc/dnsmasq.d
+  tags_file: quota-tags.conf
+  rules_file: quota-domains.conf
+  reload_dnsmasq: true
+  preset_cache_dir: data/dns_presets
+
+# Device presence probes:
+#   latency_probe (ON by default) — the box raw-ARPs every leased client and
+#      times the replies; the responder set drives the device-card LED
+#      (connected NOW vs grey). Works on ANY hardware; no monitor mode needed.
+#   wifi_probe (OFF by default) — only when the box HAS a monitor-capable
+#      WiFi card: passive air sniffing (airmon-ng + airodump-ng, Kali staples)
+#      collects SSID snapshots for the yield check; the interface must be a
+#      card NOT used for anything else.
+network:
+  latency_probe:
+    enabled: true           # ARP-RTT probe driving the online LED (any hardware)
+    samples: 6              # ARP requests per device per sweep
+    min_samples: 2          # replies required before counting a device seen
+                            # (low on purpose: sleepy phones answer ~2/6)
+    threshold_ms: 1.0       # informational only — no classification anymore
+    min_consistent: 2       # agreeing sweeps before the LED state flips (no flap)
+    interval_s: 30          # sweep cadence
+    timeout_s: 0.5          # per-sweep receive timeout
+  wifi_probe:
+    enabled: false          # ON only with a monitor-capable spare WiFi card
+    interface: ""           # e.g. wlan0; empty = auto-detect the first wlan*
+    poll_interval: 5        # CSV re-read cadence (seconds)
+    sighted_ttl: 600        # a heard device stays "WiFi" this long while idle
+    lan_after_seconds: 300  # leased + never heard for this long => "LAN"
+
+# Self-update checks (Admin tab): the box compares its own version
+# (quota/version.py) against the latest GitHub release every 24 h and
+# notifies when an update exists ("Show details" = the new changelog).
+# The Admin-tab "check automatically" / "auto-install" toggles live in the DB;
+# this block is the master switch + where the releases live.
+#   enabled: true           # false = whole subsystem off (endpoints 404)
+#   repo: UserJoo9/QuotaManager  # GitHub owner/repo (releases + CHANGELOG.md)
+#   interval_hours: 24      # release-check cadence
+updates:
+  enabled: true
+  repo: UserJoo9/QuotaManager
+  interval_hours: 24
+
+# Kernel firewall (nftables table `inet quota_firewall`), layered NEXT TO the
+# quota engine (forward/input hook priority -100, before the engine's priority
+# 0): firewall-denied traffic never reaches the quota counters, and quota cuts
+# still apply afterward. It never touches quota_gateway/quota_nat/quota_arp_lock.
+#   enabled: true           # false = table exists but is empty (permissive)
+#   watchdog_seconds: 45    # safe-apply watchdog: re-verify + auto-revert to
+#                           # last-good if the admin is locked out
+#   probe_ip: ""            # the IP never denied; empty = the box's client IP
+#   services: []            # box services exposed on ppp0 (WAN mode), e.g.
+#                           #   - {name: ssh, protocol: tcp, port: 22}
+#   port_forwards: []       # WAN-mode inbound forwards (dnat), e.g.
+#                           #   - {name: rdp, protocol: tcp, source_port: 3389,
+#                           #      target_ip: 192.168.2.42, target_port: 3389}
+#   dmz: ""                 # WAN-mode DMZ target IP; empty = off
+#   rules: []               # ordered custom rules, e.g.
+#                           #   - {name: block-bt, chain: forward, action: deny,
+#                           #      protocol: tcp, dst_port: 6881}
+#   allow_cidrs: []         # allowlist (bypasses the WAN default-deny)
+#   deny_cidrs: []          # blocklist (deny > allow)
+#   syn_flood: {rate: 10, burst: 20}   # box + forwarded-service SYN guard
+#   brute_force: {threshold: 10, ban_seconds: 1800}  # login failures -> kernel ban
+#   scan_detect: {enabled: true, syn_threshold: 200, ban_seconds: 3600}
+#   geo_block: false        # country blocking; map from the firewall_geo DB
+#                           # setting ({CC: [cidr, ...]}) — inert when off/empty
+#   wan_confirmed: false    # EXPLICIT opt-in to expose the dashboard on ppp0 in
+#                           # WAN mode; never implied (a WAN-facing admin UI is
+#                           # the box's #1 risk). Port-forwards + DMZ are WAN-only.
+# The mode (LAN permissive / WAN default-deny-inbound) is DERIVED from
+# engine.topology at render time — never stored. The DB setting
+# `firewall_config` (JSON, edited in the dashboard Firewall tab) is the runtime
+# master once set; this block seeds it on first boot.
+firewall:
+  enabled: true
+  watchdog_seconds: 45
+  probe_ip: ""
+  services: []
+  port_forwards: []
+  dmz: ""
+  rules: []
+  allow_cidrs: []
+  deny_cidrs: []
+  syn_flood:
+    rate: 10
+    burst: 20
+  brute_force:
+    threshold: 10
+    ban_seconds: 1800
+  scan_detect:
+    enabled: true
+    syn_threshold: 200
+    ban_seconds: 3600
+  geo_block: false
+  wan_confirmed: false

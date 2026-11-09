@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>My quota — MKnet Network Manager</title>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/assets/pub.css?v=1">
+<script src="/assets/pub-theme.js"></script>
+<script src="/assets/pub-i18n.js"></script>
+<script src="/assets/i18n-milestone.js"></script>
+<style>
+  /* Milestone page: a lightweight, public view — no admin session. */
+  body { display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .ms-wrap { width: 100%; max-width: 560px; }
+  .ms-card { padding: 28px 30px; }
+  .ms-hero { text-align: center; margin-bottom: 22px; }
+  .ms-hero .logo { font-size: 1.4rem; }
+  .ms-hero .subtitle { color: var(--text-dim); font-size: 0.9rem; margin-top: 4px; }
+  .ms-num { font-size: 2.6rem; font-weight: 800; letter-spacing: -1px;
+            background: linear-gradient(120deg, var(--accent-3), var(--accent));
+            -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .ms-bar { height: 10px; border-radius: 6px; background: var(--glass-bg-2);
+            overflow: hidden; margin: 12px 0 6px; }
+  .ms-bar > div { height: 100%; border-radius: 6px;
+                  background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+  .ms-devices { list-style: none; margin-top: 16px; }
+  .ms-device { display: flex; align-items: center; justify-content: space-between;
+               gap: 12px; padding: 10px 12px; border-radius: var(--radius-md);
+               background: color-mix(in srgb, var(--text) 3%, transparent); border: 1px solid var(--glass-border); }
+  .ms-device + .ms-device { margin-top: 8px; }
+  .ms-name { font-weight: 600; }
+  .ms-mac { color: var(--text-dim); font-size: 0.75rem; font-family: ui-monospace, monospace; }
+  .ms-bytes { text-align: right; font-size: 0.85rem; color: var(--text-dim); white-space: nowrap; }
+  .ms-bytes b { color: var(--text); }
+  .ms-milestones { display: flex; gap: 10px; margin-top: 18px; }
+  .ms-pill { flex: 1; text-align: center; padding: 10px 8px; border-radius: var(--radius-md);
+            border: 1px solid var(--glass-border); background: var(--glass-bg); font-size: 0.8rem; }
+  .ms-pill.reached { border-color: color-mix(in srgb, var(--ok) 45%, transparent); color: var(--ok); }
+  .ms-pill.warn { border-color: color-mix(in srgb, var(--warn) 50%, transparent); color: var(--warn); }
+  .ms-pill.done { border-color: color-mix(in srgb, var(--accent-2) 35%, transparent); color: var(--text-dim); }
+  .ms-note { margin-top: 14px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.5; }
+  .ms-actions { margin-top: 18px; display: flex; gap: 10px; }
+  .ms-daily { margin-top: 20px; padding: 14px 16px; border-radius: var(--radius-md);
+              border: 1px solid var(--glass-border); background: color-mix(in srgb, var(--text) 3%, transparent); }
+  .ms-daily h3 { font-size: 0.95rem; margin-bottom: 6px; }
+  .ms-daily .ms-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .ms-chip { padding: 3px 9px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--glass-border); }
+  .ms-chip.heavy { border-color: var(--accent); color: var(--accent); }
+  .ms-edit { margin-top: 12px; display: grid; gap: 8px; font-size: 0.82rem; }
+  .ms-edit label { display: grid; gap: 4px; color: var(--text-dim); }
+  .ms-edit select, .ms-edit input { padding: 7px 9px; border-radius: 8px; border: 1px solid var(--glass-border);
+              background: var(--glass-bg); color: var(--text); font: inherit; }
+  .ms-edit select, .ms-edit input { width: 100%; min-width: 0; box-sizing: border-box; }
+  .ms-edit .row { display: flex; gap: 8px; }
+  .ms-edit .row input[type=number] { width: 80px; flex: none; }
+  @media (max-width: 480px) {
+    /* align to the top so a long device list scrolls naturally instead of
+       clipping off both ends of the centered flex */
+    body { padding: 12px; align-items: flex-start; padding-top: 16px; }
+    .ms-card { padding: 22px 18px; }
+    .ms-num { font-size: 2.2rem; }
+    .ms-milestones { gap: 6px; }
+    .ms-pill { padding: 8px 4px; font-size: 0.72rem; }
+    .ms-device { gap: 8px; padding: 10px; }
+    .ms-bytes { font-size: 0.78rem; }
+  }
+</style>
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <div class="ms-wrap screen">
+    <div class="glass card ms-card">
+      <div class="ms-hero" id="ms-hero">
+        <h1 class="logo">Quota<span>Manager</span></h1>
+        <p class="subtitle">Your internet allowance this period</p>
+      </div>
+
+      <div id="ms-loading" class="ms-note">Loading…</div>
+
+      <div id="ms-content" class="hidden">
+        <div class="ms-num" id="ms-percent">—</div>
+        <div class="ms-note" id="ms-summary"></div>
+        <div class="ms-bar"><div id="ms-bar-fill" style="width:0%"></div></div>
+
+        <div id="ms-milestones" class="ms-milestones"></div>
+
+        <div id="ms-daily" class="ms-daily hidden"></div>
+
+        <h3 style="margin-top:20px; font-size:0.95rem;">Your devices</h3>
+        <ul class="ms-devices" id="ms-devices"></ul>
+
+        <p class="ms-note" id="ms-noted" style="display:none; color: var(--ok);">✔ Noted — you're on track.</p>
+
+        <div class="ms-actions">
+          <button id="ms-refresh" class="btn ghost">Refresh</button>
+        </div>
+      </div>
+
+      <div id="ms-unrecognized" class="hidden">
+        <p class="ms-note">This device isn't recognized on the quota network. It has no active
+        DHCP lease, so there's nothing to show here yet. Reconnect to the gateway
+        Wi-Fi and try again.</p>
+      </div>
+    </div>
+  </div>
+
+<script disable-devtool-auto src='/assets/detector.js'></script>
+<script>
+(function () {
+  var LOC = function () { return QMI.lang === 'ar' ? 'ar-u-nu-latn' : undefined; };
+  var lastData = null, relang = false;
+  // LRI..PDI keeps "62.00 GB" in one left-to-right run inside Arabic text.
+  var iso = function (x) { return '\u2066' + x + '\u2069'; };
+  var fmt = function (gb) {
+    if (gb >= 1000) return iso((gb / 1024).toFixed(2) + ' TB');
+    return iso(gb.toFixed(2) + ' GB');
+  };
+  var pendingNotified = [];
+
+  function render(data) {
+    lastData = data;
+    if (!data || !data.recognized) {
+      document.getElementById('ms-loading').classList.add('hidden');
+      document.getElementById('ms-unrecognized').classList.remove('hidden');
+      return;
+    }
+    var u = data.user;
+    var pct = u.percent;
+    document.getElementById('ms-loading').classList.add('hidden');
+    document.getElementById('ms-content').classList.remove('hidden');
+
+    document.getElementById('ms-percent').textContent = pct.toFixed(0) + '%';
+    var used = fmt(u.used_gb), allowance = fmt(u.allowance_gb);
+    document.getElementById('ms-summary').textContent =
+      QMI.t('You have used {used} of your {allowance} allowance.', {used: used, allowance: allowance});
+    var fill = document.getElementById('ms-bar-fill');
+    fill.style.width = Math.min(100, pct) + '%';
+
+    // milestone pills: 50/75/100
+    var box = document.getElementById('ms-milestones');
+    box.innerHTML = '';
+    var labels = {50: QMI.t('Halfway'), 75: QMI.t('Almost there'), 100: QMI.t('Cap reached')};
+    var ms = u.milestones;
+    [50, 75, 100].forEach(function (m) {
+      var pill = document.createElement('div');
+      pill.className = 'ms-pill';
+      var state = ms[m];
+      if (!state.crossed) {
+        pill.classList.add('done');
+        pill.textContent = labels[m] + ' · ' + m + '%';
+      } else if (!state.notified) {
+        pill.classList.add('warn');
+        pill.textContent = QMI.t('⚠ {label} ({m}%) — new', {label: labels[m], m: m});
+        pendingNotified.push({user_id: u.id, milestone: m});
+      } else {
+        pill.classList.add('reached');
+        pill.textContent = QMI.t('✓ {label} ({m}%)', {label: labels[m], m: m});
+      }
+      box.appendChild(pill);
+    });
+
+    renderDaily(data.daily);
+
+    // per-device breakdown
+    var list = document.getElementById('ms-devices');
+    list.innerHTML = '';
+    if (!data.devices.length) {
+      var li = document.createElement('li');
+      li.className = 'ms-device';
+      li.innerHTML = '<span class="ms-name">' + QMI.t('No devices on record') + '</span>';
+      list.appendChild(li);
+    }
+    data.devices.forEach(function (d) {
+      var li = document.createElement('li');
+      li.className = 'ms-device';
+      var name = d.name || d.mac;
+      li.innerHTML =
+        '<div><div class="ms-name">' + esc(name) + '</div>' +
+        '<div class="ms-mac">' + esc(d.mac) + '</div></div>' +
+        '<div class="ms-bytes"><b>' + fmt(d.device_used_gb) + '</b> ' + QMI.t('total') +
+        '<br>↑ ' + fmt(d.device_up_gb) + ' · ↓ ' + fmt(d.device_down_gb) + '</div>';
+      list.appendChild(li);
+    });
+
+    // acknowledge pending milestones once
+    if (pendingNotified.length && !relang) {
+      ack();
+    }
+  }
+
+  var heavyDraft = null;
+
+  function mk(tag, text, cls) {
+    var e = document.createElement(tag);
+    if (text != null) e.textContent = text;
+    if (cls) e.className = cls;
+    return e;
+  }
+
+  function renderDaily(q) {
+    var box = document.getElementById('ms-daily');
+    if (!q) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    box.innerHTML = '';
+    box.appendChild(mk('h3', QMI.t("Today's plan")));
+    if (q.error) { box.appendChild(mk('div', q.error, 'ms-note')); return; }
+    var pct = q.cap_gb > 0 ? Math.min(100, q.used_gb / q.cap_gb * 100) : 100;
+    box.appendChild(mk('div', QMI.t('Used {a} of {b} today', {a: fmt(q.used_gb), b: fmt(q.cap_gb)}), 'ms-note'));
+    var bar = mk('div', null, 'ms-bar'); var fillEl = document.createElement('div');
+    fillEl.style.width = pct + '%'; bar.appendChild(fillEl); box.appendChild(bar);
+    if (q.blocked) {
+      var t = new Date(q.resets_at);
+      box.appendChild(mk('div', QMI.t('Daily limit reached. Your internet is back at {time}.',
+        {time: t.toLocaleTimeString(LOC(), {hour: '2-digit', minute: '2-digit'})}), 'ms-note'));
+    }
+    var chips = mk('div', null, 'ms-chips');
+    (q.schedule || []).slice(1, 8).forEach(function (r) {
+      var d = new Date(r.date + 'T00:00:00');
+      chips.appendChild(mk('span', d.toLocaleDateString(LOC(), {month: 'short', day: 'numeric'}) +
+        ' · ' + iso(r.cap_gb.toFixed(1) + ' GB'), 'ms-chip' + (r.heavy ? ' heavy' : '')));
+    });
+    box.appendChild(chips);
+    if (q.self_edit) renderEdit(box, q);
+  }
+
+  function renderEdit(box, q) {
+    if (!heavyDraft) heavyDraft = JSON.parse(JSON.stringify(q.heavy || {}));
+    var form = mk('div', null, 'ms-edit');
+    var carry = document.createElement('select');
+    [['next_day', QMI.t('Move to the next day')], ['spread', QMI.t('Spread over the remaining days')]].forEach(function (o) {
+      var op = mk('option', o[1]); op.value = o[0]; if (q.carry === o[0]) op.selected = true; carry.appendChild(op);
+    });
+    var split = document.createElement('select');
+    [['open', QMI.t('Devices share the pool')], ['equal', QMI.t('Equal slice per device')]].forEach(function (o) {
+      var op = mk('option', o[1]); op.value = o[0]; if (q.split === o[0]) op.selected = true; split.appendChild(op);
+    });
+    var l1 = mk('label', QMI.t('Unused GB of a day')); l1.appendChild(carry);
+    var l2 = mk('label', QMI.t('Between your devices')); l2.appendChild(split);
+    var l3 = mk('label', QMI.t('Heavier days'));
+    var list = mk('div', null, 'ms-chips');
+    function paint() {
+      list.innerHTML = '';
+      Object.keys(heavyDraft).sort().forEach(function (d) {
+        var c = mk('span', iso(d + ' · ' + heavyDraft[d] + ' GB'), 'ms-chip heavy');
+        var x = mk('button', '×'); x.type = 'button'; x.style.cssText = 'background:none;border:0;color:inherit;cursor:pointer';
+        x.addEventListener('click', function () { delete heavyDraft[d]; paint(); });
+        c.appendChild(x); list.appendChild(c);
+      });
+    }
+    paint();
+    var day = document.createElement('input'); day.type = 'date';
+    var t = new Date();
+    day.min = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
+    var gb = document.createElement('input'); gb.type = 'number'; gb.min = '0'; gb.step = 'any'; gb.placeholder = 'GB';
+    var add = mk('button', QMI.t('Add'), 'btn ghost'); add.type = 'button';
+    add.addEventListener('click', function () {
+      if (day.value && +gb.value > 0) { heavyDraft[day.value] = +gb.value; day.value = ''; gb.value = ''; paint(); }
+    });
+    var row = mk('div', null, 'row'); row.appendChild(day); row.appendChild(gb); row.appendChild(add);
+    l3.appendChild(list); l3.appendChild(row);
+    var msg = mk('div', '', 'ms-note');
+    var save = mk('button', QMI.t('Save'), 'btn'); save.type = 'button';
+    save.addEventListener('click', function () {
+      fetch('/api/milestone/daily-plan', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json', 'X-QM-CSRF': '1'},
+        body: JSON.stringify({carry: carry.value, split: split.value, heavy: heavyDraft})
+      }).then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
+        .then(function (res) {
+          msg.textContent = res[0] ? QMI.t('Saved - applied now.') : (res[1].detail || QMI.t('Could not save.'));
+          if (res[0]) { heavyDraft = null; load(); }
+        }).catch(function () { msg.textContent = QMI.t('Could not reach the gateway.'); });
+    });
+    [l1, l2, l3, save, msg].forEach(function (e) { form.appendChild(e); });
+    box.appendChild(form);
+  }
+
+  function ack() {
+    var first = pendingNotified.shift();
+    if (!first) {
+      var n = document.getElementById('ms-noted');
+      n.style.display = 'block';
+      return;
+    }
+    fetch('/api/milestone/notify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(first)
+    }).then(function (r) { return r.json(); })
+      .then(function () { ack(); })
+      .catch(function () { ack(); });
+  }
+
+  function esc(s) {
+    var div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function load() {
+    pendingNotified = [];
+    fetch('/api/milestone')
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () {
+        document.getElementById('ms-loading').textContent =
+          QMI.t('Could not reach the gateway. Try again later.');
+      });
+  }
+
+  QMI.mount(document.getElementById('ms-hero'), 'btn ghost');
+  QMI.onChange(function () { if (lastData) { var h = heavyDraft; relang = true; render(lastData); relang = false; heavyDraft = h; } });
+  document.getElementById('ms-refresh').addEventListener('click', load);
+  load();
+})();
+</script>
+</body>
+</html>
