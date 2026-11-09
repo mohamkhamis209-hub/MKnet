@@ -1,0 +1,538 @@
+"""ARP-RTT probe (quota/latency_probe.py) — drives the device-card LED
+(connected NOW) by probing every leased client by ARP round-trip time.
+
+The raw-socket backend needs root + Linux (never exercised here); the
+classifier math, the ping-parse fallback and run.py's sweep wiring are tested
+against fakes, mirroring the arp_scan/wifi_probe test style.
+"""
+
+import asyncio
+import time
+
+from quota.latency_probe import (LAN, UNKNOWN, WIFI, ArpRttProbe,
+                                 classify_rtts)
+
+
+def test_classify_min_sample_rule():
+    """The FASTEST sample decides: local scheduling noise only inflates
+    RTTs, so the best-case delivery is the true path latency."""
+    assert classify_rtts([0.2, 0.3, 0.4, 1.9], 1.0) == LAN
+    assert classify_rtts([2.5, 3.1, 4.0, 0.4], 1.0) == LAN
+    assert classify_rtts([1.2, 3.5, 5.0, 2.0], 1.0) == WIFI
+    assert classify_rtts([0.9, 1.1, 0.8], 1.0) == LAN
+    assert classify_rtts([1.0, 1.0, 1.0], 1.0) == WIFI  # threshold inclusive
+
+
+def test_classify_needs_min_samples():
+    """Too few replies => UNKNOWN (caller keeps the previous label)."""
+    assert classify_rtts([0.2], 1.0) == UNKNOWN
+    assert classify_rtts([0.2, 0.3], 1.0) == UNKNOWN
+    assert classify_rtts([], 1.0) == UNKNOWN
+    assert classify_rtts([2.0, 2.1, 2.2], 1.0, min_samples=4) == UNKNOWN
+    assert classify_rtts([2.0, 2.1, 2.2, 2.3], 1.0, min_samples=4) == WIFI
+
+
+def test_probe_ping_fallback_parses_time_ms():
+    """Without raw sockets — no root, non-Linux, or a refused factory — the
+    probe parses ``time=`` values out of ping. ICMP-blocking clients are
+    simply not classified. (The factory refusal makes the fallback
+    deterministic on EVERY platform, including root-on-Linux CI.)"""
+    calls = []
+
+    def no_raw_socket():
+        raise OSError("raw sockets unavailable (root?)")
+
+    def fake_run(argv):
+        calls.append(argv)
+        if argv[0] == "ping":
+            if "1.2.3.4" in argv:
+                return 0, ("PING 1.2.3.4 (1.2.3.4) 56(84) bytes of data.\n"
+                           "64 bytes from 1.2.3.4: icmp_seq=1 ttl=64 time=2.51 ms\n"
+                           "64 bytes from 1.2.3.4: icmp_seq=2 ttl=64 time=1.98 ms\n"
+                           "64 bytes from 1.2.3.4: icmp_seq=3 ttl=64 time=2.10 ms\n")
+            return 1, "100% packet loss"
+        if "addr" in argv:
+            return 0, ("2: eth0    inet 192.168.2.1/24 brd 192.168.2.255 "
+                       "scope global eth0\\\n")
+        if "link" in argv:
+            return 0, "2: eth0    link/ether 11:22:33:44:55:66 brd ff:ff:ff:ff:ff:ff\n"
+        return 0, ""
+
+    probe = ArpRttProbe(_cfg(), run_command=fake_run,
+                        socket_factory=no_raw_socket)
+    assert probe.enabled
+    rtts = probe.probe(["1.2.3.4", "10.0.0.9"])
+    assert rtts == {"1.2.3.4": [2.51, 1.98, 2.10]}
+    assert [c[0] for c in calls] == ["ip", "ip", "ping", "ping"]
+    assert classify_rtts(rtts["1.2.3.4"], 1.0) == WIFI
+
+
+def test_probe_raw_backend_times_replies():
+    """The raw backend (fake socket) maps each reply's ARP sender IP to the
+    request timestamps — RTTs are >= 0 and replies without a pending request
+    are dropped."""
+    import socket
+    from quota.arp_scan import arp_reply_frame
+
+    sent = []
+
+    class FakeSock:
+        """One reply per request, delivered only AFTER its request goes out
+        (interleaved semantics: a reply that lands before its request is a
+        spurious/early frame and must be dropped)."""
+
+        def __init__(self):
+            self._sent = 0
+            self._popped = 0
+            self._garbage = True
+            self._replies = [
+                arp_reply_frame("aa:bb:cc:dd:ee:01", "1.2.3.4",
+                                "11:22:33:44:55:66", "192.168.2.1"),
+                arp_reply_frame("aa:bb:cc:dd:ee:01", "1.2.3.4",
+                                "11:22:33:44:55:66", "192.168.2.1"),
+            ]
+
+        def bind(self, _a): pass
+
+        def send(self, frame):
+            self._sent += 1
+            sent.append(frame)
+
+        def settimeout(self, _t): pass
+
+        def recv(self, _n):
+            if self._garbage:
+                self._garbage = False
+                return b"garbage"
+            if self._popped < self._sent:
+                self._popped += 1
+                return self._replies[self._popped - 1]
+            raise socket.timeout
+
+        def close(self): pass
+
+    def fake_run(argv):
+        if "addr" in argv:
+            return 0, ("2: eth0    inet 192.168.2.1/24 brd 192.168.2.255 "
+                       "scope global eth0\\\n")
+        if "link" in argv:
+            return 0, "2: eth0    link/ether 11:22:33:44:55:66 brd ff:ff:ff:ff:ff:ff\n"
+        return 0, ""
+
+    cfg = _cfg()
+    probe = ArpRttProbe(
+        cfg, run_command=fake_run, samples=2, timeout_s=0.01,
+        inter_round_s=0.0, socket_factory=FakeSock)
+    rtts = probe.probe(["1.2.3.4"])
+    assert rtts["1.2.3.4"] and len(rtts["1.2.3.4"]) == 2
+    assert all(r >= 0 for r in rtts["1.2.3.4"])
+    assert sent  # requests were actually sent
+
+
+def test_probe_degrades_to_empty_when_disabled():
+    """A cfg whose LAN NIC cannot resolve (empty gateway) => enabled False =>
+    probe() is a no-op, never opening a socket or running a command."""
+    from core.config import Config
+
+    cfg = Config()
+    cfg.dhcp.gateway_ip = ""  # no client gateway => no resolvable networks
+    calls = []
+    probe = ArpRttProbe(
+        cfg, run_command=lambda argv: calls.append(argv) or (0, ""))
+    assert not probe.enabled
+    assert probe.probe(["1.2.3.4"]) == {}
+    assert calls == []
+
+
+def test_probe_catches_slow_waking_devices():
+    """A power-save device (sleeping phone / NIC-sleeping PC) wakes seconds
+    after the first request. The interleaved rounds keep a reply window open
+    for the WHOLE sweep, so its post-wake replies still get sampled."""
+    import socket
+    from quota.arp_scan import arp_reply_frame
+
+    wake_after_drains = 3  # device only answers once it is awake
+    drain_calls = [0]
+
+    class SlowSock:
+        def __init__(self):
+            self._replies = [
+                arp_reply_frame("aa:bb:cc:dd:ee:01", "1.2.3.4",
+                                "11:22:33:44:55:66", "192.168.2.1"),
+                arp_reply_frame("aa:bb:cc:dd:ee:01", "1.2.3.4",
+                                "11:22:33:44:55:66", "192.168.2.1"),
+                arp_reply_frame("aa:bb:cc:dd:ee:01", "1.2.3.4",
+                                "11:22:33:44:55:66", "192.168.2.1"),
+            ]
+            self._woke = False
+
+        def bind(self, _a): pass
+
+        def send(self, _f): pass
+
+        def settimeout(self, _t): pass
+
+        def recv(self, _n):
+            drain_calls[0] += 1
+            if drain_calls[0] <= wake_after_drains:
+                raise socket.timeout  # still waking up
+            if not self._woke:
+                self._woke = True
+                time.sleep(0.05)  # wake latency — real RTT, well over 1 ms
+            if not self._replies:
+                raise socket.timeout
+            return self._replies.pop(0)
+
+        def close(self): pass
+
+    def fake_run(argv):
+        if "addr" in argv:
+            return 0, ("2: eth0    inet 192.168.2.1/24 brd 192.168.2.255 "
+                       "scope global eth0\\\n")
+        if "link" in argv:
+            return 0, "2: eth0    link/ether 11:22:33:44:55:66 brd ff:ff:ff:ff:ff:ff\n"
+        return 0, ""
+
+    probe = ArpRttProbe(
+        _cfg(), run_command=fake_run, samples=6, timeout_s=0.01,
+        inter_round_s=0.0, socket_factory=SlowSock)
+    rtts = probe.probe(["1.2.3.4"])
+    assert len(rtts["1.2.3.4"]) == 3
+    assert classify_rtts(rtts["1.2.3.4"], 1.0) == WIFI
+
+
+def test_probe_degrades_to_empty_when_nic_unresolvable():
+    """resolve_nic failure (no NIC owns the client gateway) => empty map,
+    no command storm."""
+    def fake_run(argv):
+        return 0, ""  # `ip -o -4 addr show` finds nothing
+
+    probe = ArpRttProbe(_cfg(), run_command=fake_run)
+    assert probe.enabled
+    assert probe.probe(["1.2.3.4"]) == {}
+
+
+def _cfg():
+    """A config with a resolvable client subnet (the probe only needs the
+    dhcp block; every backend is faked or degraded in these tests)."""
+    from core.config import Config
+    from core.config import DhcpConfig
+
+    cfg = Config()
+    cfg.dhcp = DhcpConfig(
+        gateway_ip="192.168.2.1",
+        subnet="255.255.255.0",
+        router_ip="192.168.1.1",
+        uplink_ip="192.168.1.110",
+    )
+    return cfg
+
+
+def test_gateway_builds_probe_from_config(tmp_path):
+    """run.py wiring: with the default latency_probe.enabled=True the Gateway
+    owns an ArpRttProbe; with enabled=False it owns None. An injected fake is
+    honored for sweep tests."""
+    from core.config import Config
+    from run import Gateway
+
+    gw = Gateway(Config())
+    assert gw.latency_probe is not None
+    assert gw.latency_probe.enabled is True  # dhcp defaults resolve a subnet
+
+    cfg = Config()
+    cfg.network.latency_probe.enabled = False
+    gw2 = Gateway(cfg)
+    assert gw2.latency_probe is None
+
+
+def test_latency_tick_populates_responders(tmp_path):
+    """Sweep wiring: the ARP probe populates the responder set for LED
+    connected status; the monitor probe (available=True) yields the sweep
+    entirely."""
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / "lat.db")
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1",
+                          subnet="255.255.255.0")
+    cfg.network.latency_probe.samples = 3
+    cfg.network.latency_probe.interval_s = 0.0  # every tick sweeps
+    gw = Gateway(cfg)
+
+    class FakeProbe:
+        def probe(self, targets):
+            out = {}
+            for ip in targets:
+                out[ip] = [4.0, 3.5, 4.2] if ip == "192.168.2.2" else [0.2, 0.3, 0.2]
+            return out
+
+    gw.latency_probe = FakeProbe()
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw.service.ensure_period())
+        for mac, ip in (("aa:bb:cc:dd:ee:01", "192.168.2.2"),
+                        ("aa:bb:cc:dd:ee:02", "192.168.2.3")):
+            loop.run_until_complete(
+                gw.database.upsert_device(mac, name=mac))
+            loop.run_until_complete(gw.database.set_lease(mac, ip))
+        # sweep: both devices answered
+        loop.run_until_complete(gw._maybe_latency_tick())
+        # responders = the LED's "connected NOW" source
+        assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
+        # ONE empty sweep keeps the old responder map (probe-degradation
+        # grace); a second empty sweep in a row clears it (nobody is home).
+        gw.latency_probe = type("P", (), {"probe": staticmethod(
+            lambda targets: {})})()
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == set()
+        # monitor probe available => the latency sweep yields
+        gw.wifi_probe = type("P", (), {"snapshot": staticmethod(
+            lambda: {"available": True, "error": "", "ssid_by_mac": {},
+                     "wireless_macs": [], "ssids": []})})()
+        loop.run_until_complete(gw._wifi_probe_tick())
+        gw.latency_probe = type("P", (), {"probe": staticmethod(
+            lambda targets: [])})()
+        loop.run_until_complete(gw._maybe_latency_tick())
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_empty_sweep_preserves_old_responder_map(tmp_path):
+    """A single empty ARP sweep (probe returns {}) keeps the old responder
+    map — this prevents the 'all LEDs gray while traffic flows' bug when the
+    probe backend hiccups. Two empty sweeps in a row clear it (see
+    test_two_empty_sweeps_clear_led)."""
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / "empty_sweep.db")
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1",
+                          subnet="255.255.255.0")
+    cfg.network.latency_probe.samples = 3
+    cfg.network.latency_probe.min_samples = 1
+    cfg.network.latency_probe.interval_s = 0.0
+    gw = Gateway(cfg)
+
+    sweep_count = [0]
+    def fake_probe(targets):
+        sweep_count[0] += 1
+        if sweep_count[0] == 1:
+            # First sweep: both reply
+            return {"192.168.2.2": [0.3], "192.168.2.3": [0.2]}
+        # Second sweep: empty (probe degradation)
+        return {}
+
+    gw.latency_probe = type("P", (), {"probe": staticmethod(fake_probe)})
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw.service.ensure_period())
+        for mac, ip in (("aa:bb:cc:dd:ee:01", "192.168.2.2"),
+                        ("aa:bb:cc:dd:ee:02", "192.168.2.3")):
+            loop.run_until_complete(
+                gw.database.upsert_device(mac, name=mac))
+            loop.run_until_complete(gw.database.set_lease(mac, ip))
+        # sweep 1: both reply
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
+        # sweep 2: empty — old map preserved
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_neigh_active_ips_reinforce_led(tmp_path):
+    """IPs from the kernel neighbor table (ip neigh) are merged into the
+    responder set, so a device that missed the ARP burst but is generating
+    traffic still shows blue."""
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / "neigh.db")
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1",
+                          subnet="255.255.255.0")
+    cfg.network.latency_probe.samples = 3
+    cfg.network.latency_probe.min_samples = 1
+    cfg.network.latency_probe.interval_s = 0.0
+    gw = Gateway(cfg)
+
+    # ARP probe returns only .2, but .3 is in the neighbor table
+    gw.latency_probe = type("P", (), {"probe": staticmethod(
+        lambda targets: {"192.168.2.2": [0.3]})})
+    gw._neigh_active_ips = {"192.168.2.3"}
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw.service.ensure_period())
+        for mac, ip in (("aa:bb:cc:dd:ee:01", "192.168.2.2"),
+                        ("aa:bb:cc:dd:ee:02", "192.168.2.3")):
+            loop.run_until_complete(
+                gw.database.upsert_device(mac, name=mac))
+            loop.run_until_complete(gw.database.set_lease(mac, ip))
+        loop.run_until_complete(gw._maybe_latency_tick())
+        # .2 from ARP probe + .3 from neighbor table = both connected
+        assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_collect_neigh_active_populates_active_ips(tmp_path):
+    """_collect_neigh_active parses ip -j neigh and stores active IPs in
+    _neigh_active_ips for the LED reinforcement."""
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / "neigh2.db")
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1",
+                          subnet="255.255.255.0")
+    gw = Gateway(cfg)
+
+    import json as _json
+    neigh_data = _json.dumps([
+        {"dst": "192.168.2.10", "dev": "eth0",
+         "lladdr": "aa:bb:cc:dd:ee:01", "state": "REACHABLE"},
+        {"dst": "192.168.2.11", "dev": "eth0",
+         "lladdr": "aa:bb:cc:dd:ee:02", "state": "STALE"},
+        {"dst": "192.168.2.12", "dev": "eth0",
+         "lladdr": "aa:bb:cc:dd:ee:03", "state": "FAILED"},
+    ])
+
+    calls = []
+    def fake_ip_run(argv):
+        calls.append(argv)
+        if argv == ["ip", "-j", "neigh"]:
+            return 0, neigh_data
+        return 1, ""
+    gw._ip_run = fake_ip_run
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        for mac, ip in (("aa:bb:cc:dd:ee:01", "192.168.2.10"),
+                        ("aa:bb:cc:dd:ee:02", "192.168.2.11"),
+                        ("aa:bb:cc:dd:ee:03", "192.168.2.12")):
+            loop.run_until_complete(
+                gw.database.upsert_device(mac, name=mac))
+            loop.run_until_complete(gw.database.set_lease(mac, ip))
+        loop.run_until_complete(gw._collect_neigh_active())
+        # only REACHABLE proves presence: STALE entries linger for hours after
+        # a device leaves, FAILED means unreachable
+        assert gw._neigh_active_ips == {"192.168.2.10"}
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_latency_tick_yields_to_monitor_probe(tmp_path):
+    """Even with an available probe, one sweep before the monitor is heard
+    must not fight it: the tick returns when _wifi_probe_state.available."""
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / "lat2.db")
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1",
+                          subnet="255.255.255.0")
+    cfg.network.latency_probe.interval_s = 0.0
+    gw = Gateway(cfg)
+    calls = []
+    gw.latency_probe = type("P", (), {"probe": staticmethod(
+        lambda targets: calls.append(1) or {})})()
+    gw._wifi_probe_state["available"] = True
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert calls == []
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+def _mk_gw(tmp_path, name):
+    from core.config import Config, DhcpConfig
+    from run import Gateway
+
+    cfg = Config()
+    cfg.db_path = str(tmp_path / name)
+    cfg.dhcp = DhcpConfig(gateway_ip="192.168.2.1", subnet="255.255.255.0")
+    cfg.network.latency_probe.min_samples = 1
+    cfg.network.latency_probe.interval_s = 0.0
+    return Gateway(cfg)
+
+
+def test_two_empty_sweeps_clear_led(tmp_path):
+    """Regression: a device that left the house must go grey. After two
+    consecutive sweeps where nobody answers, the responder map is cleared
+    instead of aging into 'lease-based' mode (which kept everything green)."""
+    gw = _mk_gw(tmp_path, "gone.db")
+    replies = [{"192.168.2.2": [0.3]}, {}, {}]
+    gw.latency_probe = type("P", (), {"probe": staticmethod(
+        lambda targets: replies.pop(0))})
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw.service.ensure_period())
+        loop.run_until_complete(gw.database.upsert_device("aa:bb:cc:dd:ee:01", name="a"))
+        loop.run_until_complete(gw.database.set_lease("aa:bb:cc:dd:ee:01", "192.168.2.2"))
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == {"192.168.2.2"}
+        loop.run_until_complete(gw._maybe_latency_tick())   # grace
+        assert gw._latency_active_ips() == {"192.168.2.2"}
+        loop.run_until_complete(gw._maybe_latency_tick())   # nobody home
+        assert gw._latency_active_ips() == set()
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_absent_device_not_kept_green_by_stale_neighbor(tmp_path):
+    """Regression: another device answering ARP must not drag a departed
+    device (only a STALE kernel neighbor entry) back to green."""
+    import json as _json
+    gw = _mk_gw(tmp_path, "stale.db")
+    gw.latency_probe = type("P", (), {"probe": staticmethod(
+        lambda targets: {"192.168.2.2": [0.3]})})
+    gw._ip_run = lambda argv: (0, _json.dumps([
+        {"dst": "192.168.2.2", "lladdr": "aa:bb:cc:dd:ee:01", "state": ["REACHABLE"]},
+        {"dst": "192.168.2.3", "lladdr": "aa:bb:cc:dd:ee:02", "state": ["STALE"]},
+    ])) if argv == ["ip", "-j", "neigh"] else (1, "")
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(gw.database.connect())
+        loop.run_until_complete(gw.service.ensure_period())
+        for mac, ip in (("aa:bb:cc:dd:ee:01", "192.168.2.2"),
+                        ("aa:bb:cc:dd:ee:02", "192.168.2.3")):
+            loop.run_until_complete(gw.database.upsert_device(mac, name=mac))
+            loop.run_until_complete(gw.database.set_lease(mac, ip))
+        loop.run_until_complete(gw._collect_neigh_active())
+        loop.run_until_complete(gw._maybe_latency_tick())
+        assert gw._latency_active_ips() == {"192.168.2.2"}
+    finally:
+        loop.run_until_complete(gw.database.close())
+        loop.close()
+
+
+def test_traffic_keeps_device_connected_and_no_probe_falls_back_to_neighbors(tmp_path):
+    """A device moving bytes is connected even if it missed the ARP burst; with
+    no probe running the neighbor table (not the bare lease) decides."""
+    from quota.engine import EngineCounters, EngineSnapshot
+
+    gw = _mk_gw(tmp_path, "traffic.db")
+    gw.latency_probe = None
+    # no presence signal at all yet -> None (lease-based)
+    assert gw._latency_active_ips() is None
+    gw._neigh_collected = True
+    gw._neigh_active_ips = {"192.168.2.2"}
+    gw.holder.swap(EngineSnapshot(by_ip={"192.168.2.3": EngineCounters(up=10, down=900)}))
+    assert gw._latency_active_ips() == {"192.168.2.2", "192.168.2.3"}
